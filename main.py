@@ -6,6 +6,11 @@ import random
 import re
 import time
 import webbrowser
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
+from email.utils import formataddr, formatdate, make_msgid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
@@ -15,8 +20,68 @@ import requests
 import yaml
 
 
-VERSION = "2.1.1"
+VERSION = "2.3.2"
 
+
+# === SMTP邮件配置 ===
+SMTP_CONFIGS = {
+    # Gmail
+    'gmail.com': {
+        'server': 'smtp.gmail.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    
+    # QQ邮箱
+    'qq.com': {
+        'server': 'smtp.qq.com', 
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    
+    # Outlook
+    'outlook.com': {
+        'server': 'smtp-mail.outlook.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    'hotmail.com': {
+        'server': 'smtp-mail.outlook.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    'live.com': {
+        'server': 'smtp-mail.outlook.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    
+    # 网易邮箱
+    '163.com': {
+        'server': 'smtp.163.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    '126.com': {
+        'server': 'smtp.126.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    
+    # 新浪邮箱
+    'sina.com': {
+        'server': 'smtp.sina.com',
+        'port': 587,
+        'encryption': 'TLS'
+    },
+    
+    # 搜狐邮箱
+    'sohu.com': {
+        'server': 'smtp.sohu.com',
+        'port': 587,
+        'encryption': 'TLS'
+    }
+}
 
 # === 配置管理 ===
 def load_config():
@@ -43,6 +108,7 @@ def load_config():
         "ENABLE_CRAWLER": config_data["crawler"]["enable_crawler"],
         "ENABLE_NOTIFICATION": config_data["notification"]["enable_notification"],
         "MESSAGE_BATCH_SIZE": config_data["notification"]["message_batch_size"],
+        "DINGTALK_BATCH_SIZE": config_data["notification"].get("dingtalk_batch_size", 20000),
         "BATCH_SEND_INTERVAL": config_data["notification"]["batch_send_interval"],
         "FEISHU_MESSAGE_SEPARATOR": config_data["notification"][
             "feishu_message_separator"
@@ -76,7 +142,7 @@ def load_config():
         "PLATFORMS": config_data["platforms"],
     }
 
-    # Webhook配置（环境变量优先）
+    # 通知渠道配置（环境变量优先）
     notification = config_data.get("notification", {})
     webhooks = notification.get("webhooks", {})
 
@@ -95,29 +161,49 @@ def load_config():
     config["TELEGRAM_CHAT_ID"] = os.environ.get(
         "TELEGRAM_CHAT_ID", ""
     ).strip() or webhooks.get("telegram_chat_id", "")
+    
+    # 邮件配置
+    config["EMAIL_FROM"] = os.environ.get(
+        "EMAIL_FROM", ""
+    ).strip() or webhooks.get("email_from", "")
+    config["EMAIL_PASSWORD"] = os.environ.get(
+        "EMAIL_PASSWORD", ""
+    ).strip() or webhooks.get("email_password", "")
+    config["EMAIL_TO"] = os.environ.get(
+        "EMAIL_TO", ""
+    ).strip() or webhooks.get("email_to", "")
+    config["EMAIL_SMTP_SERVER"] = os.environ.get(
+        "EMAIL_SMTP_SERVER", ""
+    ).strip() or webhooks.get("email_smtp_server", "")
+    config["EMAIL_SMTP_PORT"] = os.environ.get(
+        "EMAIL_SMTP_PORT", ""
+    ).strip() or webhooks.get("email_smtp_port", "")
 
     # 输出配置来源信息
-    webhook_sources = []
+    notification_sources = []
     if config["FEISHU_WEBHOOK_URL"]:
         source = "环境变量" if os.environ.get("FEISHU_WEBHOOK_URL") else "配置文件"
-        webhook_sources.append(f"飞书({source})")
+        notification_sources.append(f"飞书({source})")
     if config["DINGTALK_WEBHOOK_URL"]:
         source = "环境变量" if os.environ.get("DINGTALK_WEBHOOK_URL") else "配置文件"
-        webhook_sources.append(f"钉钉({source})")
+        notification_sources.append(f"钉钉({source})")
     if config["WEWORK_WEBHOOK_URL"]:
         source = "环境变量" if os.environ.get("WEWORK_WEBHOOK_URL") else "配置文件"
-        webhook_sources.append(f"企业微信({source})")
+        notification_sources.append(f"企业微信({source})")
     if config["TELEGRAM_BOT_TOKEN"] and config["TELEGRAM_CHAT_ID"]:
         token_source = (
             "环境变量" if os.environ.get("TELEGRAM_BOT_TOKEN") else "配置文件"
         )
         chat_source = "环境变量" if os.environ.get("TELEGRAM_CHAT_ID") else "配置文件"
-        webhook_sources.append(f"Telegram({token_source}/{chat_source})")
-
-    if webhook_sources:
-        print(f"Webhook 配置来源: {', '.join(webhook_sources)}")
+        notification_sources.append(f"Telegram({token_source}/{chat_source})")
+    if config["EMAIL_FROM"] and config["EMAIL_PASSWORD"] and config["EMAIL_TO"]:
+        from_source = "环境变量" if os.environ.get("EMAIL_FROM") else "配置文件"
+        notification_sources.append(f"邮件({from_source})")
+        
+    if notification_sources:
+        print(f"通知渠道配置来源: {', '.join(notification_sources)}")
     else:
-        print("未配置任何 Webhook")
+        print("未配置任何通知渠道")
 
     return config
 
@@ -1463,6 +1549,7 @@ def generate_html_report(
     id_to_name: Optional[Dict] = None,
     mode: str = "daily",
     is_daily_summary: bool = False,
+    update_info: Optional[Dict] = None,
 ) -> str:
     """生成HTML报告"""
     if is_daily_summary:
@@ -1480,7 +1567,7 @@ def generate_html_report(
     report_data = prepare_report_data(stats, failed_ids, new_titles, id_to_name, mode)
 
     html_content = render_html_content(
-        report_data, total_titles, is_daily_summary, mode
+        report_data, total_titles, is_daily_summary, mode, update_info
     )
 
     with open(file_path, "w", encoding="utf-8") as f:
@@ -1499,6 +1586,7 @@ def render_html_content(
     total_titles: int,
     is_daily_summary: bool = False,
     mode: str = "daily",
+    update_info: Optional[Dict] = None,
 ) -> str:
     """渲染HTML内容"""
     html = """
@@ -1508,6 +1596,7 @@ def render_html_content(
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>热点新闻分析</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
         <style>
             * { box-sizing: border-box; }
             body { 
@@ -1533,6 +1622,33 @@ def render_html_content(
                 color: white;
                 padding: 32px 24px;
                 text-align: center;
+                position: relative;
+            }
+            
+            .save-btn {
+                position: absolute;
+                top: 16px;
+                right: 16px;
+                background: rgba(255, 255, 255, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                color: white;
+                padding: 8px 16px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 500;
+                transition: all 0.2s ease;
+                backdrop-filter: blur(10px);
+            }
+            
+            .save-btn:hover {
+                background: rgba(255, 255, 255, 0.3);
+                border-color: rgba(255, 255, 255, 0.5);
+                transform: translateY(-1px);
+            }
+            
+            .save-btn:active {
+                transform: translateY(0);
             }
             
             .header-title {
@@ -1836,22 +1952,63 @@ def render_html_content(
                 font-family: 'SF Mono', Consolas, monospace;
             }
             
+            .footer {
+                margin-top: 32px;
+                padding: 20px 24px;
+                background: #f8f9fa;
+                border-top: 1px solid #e5e7eb;
+                text-align: center;
+            }
+            
+            .footer-content {
+                font-size: 13px;
+                color: #6b7280;
+                line-height: 1.6;
+            }
+            
+            .footer-link {
+                color: #4f46e5;
+                text-decoration: none;
+                font-weight: 500;
+                transition: color 0.2s ease;
+            }
+            
+            .footer-link:hover {
+                color: #7c3aed;
+                text-decoration: underline;
+            }
+            
+            .project-name {
+                font-weight: 600;
+                color: #374151;
+            }
+            
             @media (max-width: 480px) {
                 body { padding: 12px; }
                 .header { padding: 24px 20px; }
                 .content { padding: 20px; }
+                .footer { padding: 16px 20px; }
                 .header-info { grid-template-columns: 1fr; gap: 12px; }
                 .news-header { gap: 6px; }
                 .news-content { padding-right: 45px; }
                 .news-item { gap: 8px; }
                 .new-item { gap: 8px; }
                 .news-number { width: 20px; height: 20px; font-size: 12px; }
+                .save-btn {
+                    position: static;
+                    margin-bottom: 16px;
+                    display: block;
+                    width: fit-content;
+                    margin-left: auto;
+                    margin-right: auto;
+                }
             }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
+                <button class="save-btn" onclick="saveAsImage()">保存为图片</button>
                 <div class="header-title">热点新闻分析</div>
                 <div class="header-info">
                     <div class="info-item">
@@ -2081,7 +2238,104 @@ def render_html_content(
 
     html += """
             </div>
+            
+            <div class="footer">
+                <div class="footer-content">
+                    由 <span class="project-name">TrendRadar</span> 生成 · 
+                    <a href="https://github.com/sansan0/TrendRadar" target="_blank" class="footer-link">
+                        GitHub 开源项目
+                    </a>"""
+                    
+    if update_info:
+        html += f"""
+                    <br>
+                    <span style="color: #ea580c; font-weight: 500;">
+                        发现新版本 {update_info['remote_version']}，当前版本 {update_info['current_version']}
+                    </span>"""
+
+    html += """
+                </div>
+            </div>
         </div>
+        
+        <script>
+            async function saveAsImage() {
+                const button = document.querySelector('.save-btn');
+                const originalText = button.textContent;
+                
+                try {
+                    button.textContent = '生成中...';
+                    button.disabled = true;
+                    window.scrollTo(0, 0);
+                    
+                    // 等待页面稳定
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    
+                    // 截图前隐藏按钮
+                    button.style.visibility = 'hidden';
+                    
+                    // 再次等待确保按钮完全隐藏
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    
+                    const container = document.querySelector('.container');
+                    
+                    // 获取容器的精确位置和尺寸
+                    const rect = container.getBoundingClientRect();
+                    const computedStyle = window.getComputedStyle(container);
+                    
+                    const canvas = await html2canvas(container, {
+                        backgroundColor: '#ffffff',
+                        scale: 1.5,
+                        useCORS: true,
+                        allowTaint: false,
+                        imageTimeout: 10000,
+                        removeContainer: false,
+                        foreignObjectRendering: false,
+                        logging: false,
+                        width: container.offsetWidth,
+                        height: container.offsetHeight,
+                        x: 0,
+                        y: 0,
+                        scrollX: 0,
+                        scrollY: 0,
+                        windowWidth: window.innerWidth,
+                        windowHeight: window.innerHeight
+                    });
+                    
+                    button.style.visibility = 'visible';
+                    
+                    const link = document.createElement('a');
+                    const now = new Date();
+                    const filename = `TrendRadar_热点新闻分析_${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}.png`;
+                    
+                    link.download = filename;
+                    link.href = canvas.toDataURL('image/png', 1.0);
+                    
+                    // 触发下载
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    
+                    button.textContent = '保存成功!';
+                    setTimeout(() => {
+                        button.textContent = originalText;
+                        button.disabled = false;
+                    }, 2000);
+                    
+                } catch (error) {
+                    button.style.visibility = 'visible';
+                    button.textContent = '保存失败';
+                    setTimeout(() => {
+                        button.textContent = originalText;
+                        button.disabled = false;
+                    }, 2000);
+                }
+            }
+            
+            document.addEventListener('DOMContentLoaded', function() {
+                window.scrollTo(0, 0);
+            });
+        </script>
     </body>
     </html>
     """
@@ -2273,10 +2527,16 @@ def split_content_into_batches(
     report_data: Dict,
     format_type: str,
     update_info: Optional[Dict] = None,
-    max_bytes: int = CONFIG["MESSAGE_BATCH_SIZE"],
+    max_bytes: int = None,
     mode: str = "daily",
 ) -> List[str]:
     """分批处理消息内容，确保词组标题+至少第一条新闻的完整性"""
+    if max_bytes is None:
+        if format_type == "dingtalk":
+            max_bytes = CONFIG.get("DINGTALK_BATCH_SIZE", 20000)
+        else:
+            max_bytes = CONFIG.get("MESSAGE_BATCH_SIZE", 4000)
+    
     batches = []
 
     total_titles = sum(
@@ -2289,6 +2549,11 @@ def split_content_into_batches(
         base_header = f"**总新闻数：** {total_titles}\n\n\n\n"
     elif format_type == "telegram":
         base_header = f"总新闻数： {total_titles}\n\n"
+    elif format_type == "dingtalk":
+        base_header = f"**总新闻数：** {total_titles}\n\n"
+        base_header += f"**时间：** {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        base_header += f"**类型：** 热点分析报告\n\n"
+        base_header += "---\n\n"
 
     base_footer = ""
     if format_type == "wework":
@@ -2299,6 +2564,10 @@ def split_content_into_batches(
         base_footer = f"\n\n更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         if update_info:
             base_footer += f"\nTrendRadar 发现新版本 {update_info['remote_version']}，当前 {update_info['current_version']}"
+    elif format_type == "dingtalk":
+        base_footer = f"\n\n> 更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
+        if update_info:
+            base_footer += f"\n> TrendRadar 发现新版本 **{update_info['remote_version']}**，当前 **{update_info['current_version']}**"
 
     stats_header = ""
     if report_data["stats"]:
@@ -2306,6 +2575,8 @@ def split_content_into_batches(
             stats_header = f"📊 **热点词汇统计**\n\n"
         elif format_type == "telegram":
             stats_header = f"📊 热点词汇统计\n\n"
+        elif format_type == "dingtalk":
+            stats_header = f"📊 **热点词汇统计**\n\n"
 
     current_batch = base_header
     current_batch_has_content = False
@@ -2370,6 +2641,17 @@ def split_content_into_batches(
                     word_header = f"📈 {sequence_display} {word} : {count} 条\n\n"
                 else:
                     word_header = f"📌 {sequence_display} {word} : {count} 条\n\n"
+            elif format_type == "dingtalk":
+                if count >= 10:
+                    word_header = (
+                        f"🔥 {sequence_display} **{word}** : **{count}** 条\n\n"
+                    )
+                elif count >= 5:
+                    word_header = (
+                        f"📈 {sequence_display} **{word}** : **{count}** 条\n\n"
+                    )
+                else:
+                    word_header = f"📌 {sequence_display} **{word}** : {count} 条\n\n"
 
             # 构建第一条新闻
             first_news_line = ""
@@ -2382,6 +2664,10 @@ def split_content_into_batches(
                 elif format_type == "telegram":
                     formatted_title = format_title_for_platform(
                         "telegram", first_title_data, show_source=True
+                    )
+                elif format_type == "dingtalk":
+                    formatted_title = format_title_for_platform(
+                        "dingtalk", first_title_data, show_source=True
                     )
                 else:
                     formatted_title = f"{first_title_data['title']}"
@@ -2420,6 +2706,10 @@ def split_content_into_batches(
                     formatted_title = format_title_for_platform(
                         "telegram", title_data, show_source=True
                     )
+                elif format_type == "dingtalk":
+                    formatted_title = format_title_for_platform(
+                        "dingtalk", title_data, show_source=True
+                    )
                 else:
                     formatted_title = f"{title_data['title']}"
 
@@ -2447,6 +2737,8 @@ def split_content_into_batches(
                     separator = f"\n\n\n\n"
                 elif format_type == "telegram":
                     separator = f"\n\n"
+                elif format_type == "dingtalk":
+                    separator = f"\n---\n\n"
 
                 test_content = current_batch + separator
                 if (
@@ -2464,6 +2756,8 @@ def split_content_into_batches(
             new_header = (
                 f"\n\n🆕 本次新增热点新闻 (共 {report_data['total_new_count']} 条)\n\n"
             )
+        elif format_type == "dingtalk":
+            new_header = f"\n---\n\n🆕 **本次新增热点新闻** (共 {report_data['total_new_count']} 条)\n\n"
 
         test_content = current_batch + new_header
         if (
@@ -2485,6 +2779,8 @@ def split_content_into_batches(
                 source_header = f"**{source_data['source_name']}** ({len(source_data['titles'])} 条):\n\n"
             elif format_type == "telegram":
                 source_header = f"{source_data['source_name']} ({len(source_data['titles'])} 条):\n\n"
+            elif format_type == "dingtalk":
+                source_header = f"**{source_data['source_name']}** ({len(source_data['titles'])} 条):\n\n"
 
             # 构建第一条新增新闻
             first_news_line = ""
@@ -2500,6 +2796,10 @@ def split_content_into_batches(
                 elif format_type == "telegram":
                     formatted_title = format_title_for_platform(
                         "telegram", title_data_copy, show_source=False
+                    )
+                elif format_type == "dingtalk":
+                    formatted_title = format_title_for_platform(
+                        "dingtalk", title_data_copy, show_source=False
                     )
                 else:
                     formatted_title = f"{title_data_copy['title']}"
@@ -2538,6 +2838,10 @@ def split_content_into_batches(
                     formatted_title = format_title_for_platform(
                         "telegram", title_data_copy, show_source=False
                     )
+                elif format_type == "dingtalk":
+                    formatted_title = format_title_for_platform(
+                        "dingtalk", title_data_copy, show_source=False
+                    )
                 else:
                     formatted_title = f"{title_data_copy['title']}"
 
@@ -2564,6 +2868,8 @@ def split_content_into_batches(
             failed_header = f"\n\n\n\n⚠️ **数据获取失败的平台：**\n\n"
         elif format_type == "telegram":
             failed_header = f"\n\n⚠️ 数据获取失败的平台：\n\n"
+        elif format_type == "dingtalk":
+            failed_header = f"\n---\n\n⚠️ **数据获取失败的平台：**\n\n"
 
         test_content = current_batch + failed_header
         if (
@@ -2579,7 +2885,11 @@ def split_content_into_batches(
             current_batch_has_content = True
 
         for i, id_value in enumerate(report_data["failed_ids"], 1):
-            failed_line = f"  • {id_value}\n"
+            if format_type == "dingtalk":
+                failed_line = f"  • **{id_value}**\n"
+            else:
+                failed_line = f"  • {id_value}\n"
+            
             test_content = current_batch + failed_line
             if (
                 len(test_content.encode("utf-8")) + len(base_footer.encode("utf-8"))
@@ -2600,7 +2910,7 @@ def split_content_into_batches(
     return batches
 
 
-def send_to_webhooks(
+def send_to_notifications(
     stats: List[Dict],
     failed_ids: Optional[List] = None,
     report_type: str = "当日汇总",
@@ -2609,8 +2919,9 @@ def send_to_webhooks(
     update_info: Optional[Dict] = None,
     proxy_url: Optional[str] = None,
     mode: str = "daily",
+    html_file_path: Optional[str] = None,
 ) -> Dict[str, bool]:
-    """发送数据到多个webhook平台"""
+    """发送数据到多个通知平台"""
     results = {}
 
     if CONFIG["SILENT_PUSH"]["ENABLED"]:
@@ -2637,6 +2948,11 @@ def send_to_webhooks(
     wework_url = CONFIG["WEWORK_WEBHOOK_URL"]
     telegram_token = CONFIG["TELEGRAM_BOT_TOKEN"]
     telegram_chat_id = CONFIG["TELEGRAM_CHAT_ID"]
+    email_from = CONFIG["EMAIL_FROM"]
+    email_password = CONFIG["EMAIL_PASSWORD"]
+    email_to = CONFIG["EMAIL_TO"]
+    email_smtp_server = CONFIG.get("EMAIL_SMTP_SERVER", "")
+    email_smtp_port = CONFIG.get("EMAIL_SMTP_PORT", "")
 
     update_info_to_send = update_info if CONFIG["SHOW_VERSION_UPDATE"] else None
 
@@ -2670,8 +2986,20 @@ def send_to_webhooks(
             mode,
         )
 
+    # 发送邮件
+    if email_from and email_password and email_to:
+        results["email"] = send_to_email(
+            email_from,
+            email_password,
+            email_to,
+            report_type,
+            html_file_path,
+            email_smtp_server,
+            email_smtp_port,
+        )
+
     if not results:
-        print("未配置任何webhook URL，跳过通知发送")
+        print("未配置任何通知渠道，跳过通知发送")
 
     # 如果成功发送了任何通知，且启用了每天只推一次，则记录推送
     if CONFIG["SILENT_PUSH"]["ENABLED"] and CONFIG["SILENT_PUSH"]["ONCE_PER_DAY"] and any(results.values()):
@@ -2735,41 +3063,78 @@ def send_to_dingtalk(
     proxy_url: Optional[str] = None,
     mode: str = "daily",
 ) -> bool:
-    """发送到钉钉"""
+    """发送到钉钉（支持分批发送）"""
     headers = {"Content-Type": "application/json"}
-
-    text_content = render_dingtalk_content(report_data, update_info, mode)
-
-    payload = {
-        "msgtype": "markdown",
-        "markdown": {
-            "title": f"TrendRadar 热点分析报告 - {report_type}",
-            "text": text_content,
-        },
-    }
-
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
 
-    try:
-        response = requests.post(
-            webhook_url, headers=headers, json=payload, proxies=proxies, timeout=30
+    # 获取分批内容，使用钉钉专用的批次大小
+    batches = split_content_into_batches(
+        report_data, 
+        "dingtalk", 
+        update_info, 
+        max_bytes=CONFIG.get("DINGTALK_BATCH_SIZE", 20000),
+        mode=mode
+    )
+
+    print(f"钉钉消息分为 {len(batches)} 批次发送 [{report_type}]")
+
+    # 逐批发送
+    for i, batch_content in enumerate(batches, 1):
+        batch_size = len(batch_content.encode("utf-8"))
+        print(
+            f"发送钉钉第 {i}/{len(batches)} 批次，大小：{batch_size} 字节 [{report_type}]"
         )
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("errcode") == 0:
-                print(f"钉钉通知发送成功 [{report_type}]")
-                return True
+
+        # 添加批次标识
+        if len(batches) > 1:
+            batch_header = f"**[第 {i}/{len(batches)} 批次]**\n\n"
+            # 将批次标识插入到适当位置（在标题之后）
+            if "📊 **热点词汇统计**" in batch_content:
+                batch_content = batch_content.replace(
+                    "📊 **热点词汇统计**\n\n",
+                    f"📊 **热点词汇统计** {batch_header}\n\n"
+                )
             else:
-                print(f"钉钉通知发送失败 [{report_type}]，错误：{result.get('errmsg')}")
+                # 如果没有统计标题，直接在开头添加
+                batch_content = batch_header + batch_content
+
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": f"TrendRadar 热点分析报告 - {report_type}",
+                "text": batch_content,
+            },
+        }
+
+        try:
+            response = requests.post(
+                webhook_url, headers=headers, json=payload, proxies=proxies, timeout=30
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("errcode") == 0:
+                    print(f"钉钉第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
+                    # 批次间间隔
+                    if i < len(batches):
+                        time.sleep(CONFIG["BATCH_SEND_INTERVAL"])
+                else:
+                    print(
+                        f"钉钉第 {i}/{len(batches)} 批次发送失败 [{report_type}]，错误：{result.get('errmsg')}"
+                    )
+                    return False
+            else:
+                print(
+                    f"钉钉第 {i}/{len(batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
+                )
                 return False
-        else:
-            print(f"钉钉通知发送失败 [{report_type}]，状态码：{response.status_code}")
+        except Exception as e:
+            print(f"钉钉第 {i}/{len(batches)} 批次发送出错 [{report_type}]：{e}")
             return False
-    except Exception as e:
-        print(f"钉钉通知发送出错 [{report_type}]：{e}")
-        return False
+
+    print(f"钉钉所有 {len(batches)} 批次发送完成 [{report_type}]")
+    return True
 
 
 def send_to_wework(
@@ -2905,6 +3270,137 @@ def send_to_telegram(
     print(f"Telegram所有 {len(batches)} 批次发送完成 [{report_type}]")
     return True
 
+def send_to_email(
+    from_email: str,
+    password: str,
+    to_email: str,
+    report_type: str,
+    html_file_path: str,
+    custom_smtp_server: Optional[str] = None,
+    custom_smtp_port: Optional[int] = None,
+) -> bool:
+    """发送邮件通知"""
+    try:
+        if not html_file_path or not Path(html_file_path).exists():
+            print(f"错误：HTML文件不存在或未提供: {html_file_path}")
+            return False
+            
+        print(f"使用HTML文件: {html_file_path}")
+        with open(html_file_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        
+        domain = from_email.split('@')[-1].lower()
+        
+        if custom_smtp_server and custom_smtp_port:
+            # 使用自定义 SMTP 配置
+            smtp_server = custom_smtp_server
+            smtp_port = int(custom_smtp_port)
+            use_tls = smtp_port == 587
+        elif domain in SMTP_CONFIGS:
+            # 使用预设配置
+            config = SMTP_CONFIGS[domain]
+            smtp_server = config['server']
+            smtp_port = config['port']
+            use_tls = config['encryption'] == 'TLS'
+        else:
+            print(f"未识别的邮箱服务商: {domain}，使用通用 SMTP 配置")
+            smtp_server = f"smtp.{domain}"
+            smtp_port = 587
+            use_tls = True
+        
+        msg = MIMEMultipart('alternative')
+        
+        # 严格按照 RFC 标准设置 From header
+        sender_name = "TrendRadar"
+        msg['From'] = formataddr((sender_name, from_email))
+        
+        # 设置收件人
+        recipients = [addr.strip() for addr in to_email.split(',')]
+        if len(recipients) == 1:
+            msg['To'] = recipients[0]
+        else:
+            msg['To'] = ', '.join(recipients)
+        
+        # 设置邮件主题
+        now = get_beijing_time()
+        subject = f"TrendRadar 热点分析报告 - {report_type} - {now.strftime('%m月%d日 %H:%M')}"
+        msg['Subject'] = Header(subject, 'utf-8')
+        
+        # 设置其他标准 header
+        msg['MIME-Version'] = '1.0'
+        msg['Date'] = formatdate(localtime=True)
+        msg['Message-ID'] = make_msgid()
+        
+        # 添加纯文本部分（作为备选）
+        text_content = f"""
+TrendRadar 热点分析报告
+========================
+报告类型：{report_type}
+生成时间：{now.strftime('%Y-%m-%d %H:%M:%S')}
+
+请使用支持HTML的邮件客户端查看完整报告内容。
+        """
+        text_part = MIMEText(text_content, 'plain', 'utf-8')
+        msg.attach(text_part)
+        
+        html_part = MIMEText(html_content, 'html', 'utf-8')
+        msg.attach(html_part)
+        
+        print(f"正在发送邮件到 {to_email}...")
+        print(f"SMTP 服务器: {smtp_server}:{smtp_port}")
+        print(f"发件人: {from_email}")
+        
+        try:
+            if use_tls:
+                # TLS 模式
+                server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+                server.set_debuglevel(0)  # 设为1可以查看详细调试信息
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+            else:
+                # SSL 模式
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
+                server.set_debuglevel(0)
+                server.ehlo()
+            
+            # 登录
+            server.login(from_email, password)
+            
+            # 发送邮件
+            server.send_message(msg)
+            server.quit()
+            
+            print(f"邮件发送成功 [{report_type}] -> {to_email}")
+            return True
+            
+        except smtplib.SMTPServerDisconnected:
+            print(f"邮件发送失败：服务器意外断开连接，请检查网络或稍后重试")
+            return False
+            
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"邮件发送失败：认证错误，请检查邮箱和密码/授权码")
+        print(f"详细错误: {str(e)}")
+        return False
+    except smtplib.SMTPRecipientsRefused as e:
+        print(f"邮件发送失败：收件人地址被拒绝 {e}")
+        return False
+    except smtplib.SMTPSenderRefused as e:
+        print(f"邮件发送失败：发件人地址被拒绝 {e}")
+        return False
+    except smtplib.SMTPDataError as e:
+        print(f"邮件发送失败：邮件数据错误 {e}")
+        return False
+    except smtplib.SMTPConnectError as e:
+        print(f"邮件发送失败：无法连接到 SMTP 服务器 {smtp_server}:{smtp_port}")
+        print(f"详细错误: {str(e)}")
+        return False
+    except Exception as e:
+        print(f"邮件发送失败 [{report_type}]：{e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 # === 主分析器 ===
 class NewsAnalyzer:
@@ -3004,14 +3500,15 @@ class NewsAnalyzer:
         """获取当前模式的策略配置"""
         return self.MODE_STRATEGIES.get(self.report_mode, self.MODE_STRATEGIES["daily"])
 
-    def _has_webhook_configured(self) -> bool:
-        """检查是否配置了webhook"""
+    def _has_notification_configured(self) -> bool:
+        """检查是否配置了任何通知渠道"""
         return any(
             [
                 CONFIG["FEISHU_WEBHOOK_URL"],
                 CONFIG["DINGTALK_WEBHOOK_URL"],
                 CONFIG["WEWORK_WEBHOOK_URL"],
                 (CONFIG["TELEGRAM_BOT_TOKEN"] and CONFIG["TELEGRAM_CHAT_ID"]),
+                (CONFIG["EMAIL_FROM"] and CONFIG["EMAIL_PASSWORD"] and CONFIG["EMAIL_TO"]),
             ]
         )
 
@@ -3123,6 +3620,7 @@ class NewsAnalyzer:
             id_to_name=id_to_name,
             mode=mode,
             is_daily_summary=is_daily_summary,
+            update_info=self.update_info if CONFIG["SHOW_VERSION_UPDATE"] else None,
         )
 
         return stats, html_file
@@ -3135,16 +3633,17 @@ class NewsAnalyzer:
         failed_ids: Optional[List] = None,
         new_titles: Optional[Dict] = None,
         id_to_name: Optional[Dict] = None,
+        html_file_path: Optional[str] = None,
     ) -> bool:
         """统一的通知发送逻辑，包含所有判断条件"""
-        has_webhook = self._has_webhook_configured()
+        has_notification = self._has_notification_configured()
 
         if (
             CONFIG["ENABLE_NOTIFICATION"]
-            and has_webhook
+            and has_notification
             and self._has_valid_content(stats, new_titles)
         ):
-            send_to_webhooks(
+            send_to_notifications(
                 stats,
                 failed_ids or [],
                 report_type,
@@ -3153,15 +3652,16 @@ class NewsAnalyzer:
                 self.update_info,
                 self.proxy_url,
                 mode=mode,
+                html_file_path=html_file_path, 
             )
             return True
-        elif CONFIG["ENABLE_NOTIFICATION"] and not has_webhook:
-            print("⚠️ 警告：通知功能已启用但未配置webhook URL，将跳过通知发送")
+        elif CONFIG["ENABLE_NOTIFICATION"] and not has_notification:
+            print("⚠️ 警告：通知功能已启用但未配置任何通知渠道，将跳过通知发送")
         elif not CONFIG["ENABLE_NOTIFICATION"]:
             print(f"跳过{report_type}通知：通知功能已禁用")
         elif (
             CONFIG["ENABLE_NOTIFICATION"]
-            and has_webhook
+            and has_notification
             and not self._has_valid_content(stats, new_titles)
         ):
             mode_strategy = self._get_mode_strategy()
@@ -3205,14 +3705,16 @@ class NewsAnalyzer:
         )
 
         print(f"{summary_type}报告已生成: {html_file}")
-
+        
         # 发送通知
         self._send_notification_if_needed(
             stats,
             mode_strategy["summary_report_type"],
             mode_strategy["summary_mode"],
+            failed_ids=[],
             new_titles=new_titles,
             id_to_name=id_to_name,
+            html_file_path=html_file, 
         )
 
         return html_file
@@ -3255,13 +3757,13 @@ class NewsAnalyzer:
             print("爬虫功能已禁用（ENABLE_CRAWLER=False），程序退出")
             return
 
-        has_webhook = self._has_webhook_configured()
+        has_notification = self._has_notification_configured()
         if not CONFIG["ENABLE_NOTIFICATION"]:
             print("通知功能已禁用（ENABLE_NOTIFICATION=False），将只进行数据抓取")
-        elif not has_webhook:
-            print("未配置任何webhook URL，将只进行数据抓取，不发送通知")
+        elif not has_notification:
+            print("未配置任何通知渠道，将只进行数据抓取，不发送通知")
         else:
-            print("通知功能已启用，将发送webhook通知")
+            print("通知功能已启用，将发送通知")
 
         mode_strategy = self._get_mode_strategy()
         print(f"报告模式: {self.report_mode}")
@@ -3345,6 +3847,7 @@ class NewsAnalyzer:
                         failed_ids=failed_ids,
                         new_titles=historical_new_titles,
                         id_to_name=combined_id_to_name,
+                        html_file_path=html_file,
                     )
             else:
                 print("❌ 严重错误：无法读取刚保存的数据文件")
@@ -3373,6 +3876,7 @@ class NewsAnalyzer:
                     failed_ids=failed_ids,
                     new_titles=new_titles,
                     id_to_name=id_to_name,
+                    html_file_path=html_file,
                 )
 
         # 生成汇总报告（如果需要）
